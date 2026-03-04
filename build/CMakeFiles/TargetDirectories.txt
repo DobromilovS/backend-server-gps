@@ -1,0 +1,5 @@
+/home/dobormilov/Desktop/backend-server-gps/backend-server-gps/build/CMakeFiles/imgui.dir
+/home/dobormilov/Desktop/backend-server-gps/backend-server-gps/build/CMakeFiles/implot.dir
+/home/dobormilov/Desktop/backend-server-gps/backend-server-gps/build/CMakeFiles/main.dir
+/home/dobormilov/Desktop/backend-server-gps/backend-server-gps/build/CMakeFiles/edit_cache.dir
+/home/dobormilov/Desktop/backend-server-gps/backend-server-gps/build/CMakeFiles/rebuild_cache.dir
