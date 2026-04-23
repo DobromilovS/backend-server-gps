@@ -1,0 +1,9 @@
+.git
+.venv
+build
+.vscode
+*.md
+.dockerignore
+Dockerfile
+docker-compose.yml
+.env.example

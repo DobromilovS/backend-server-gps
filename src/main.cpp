@@ -13,8 +13,27 @@
 #include "backends/imgui_impl_opengl3.h"
 #include "backends/imgui_impl_sdl2.h"
 #include "imgui.h"
+#include <laserpants/dotenv/dotenv.h>
+#include <libpq-fe.h>
+
+#include <cstdlib>
+
 
 using json = nlohmann::json;
+
+
+struct DbConfig {
+    std::string host;
+    std::string port;
+    std::string user;
+    std::string pass;
+    std::string name;
+
+    std::string getConnectionString() const {
+        return "host=" + host + " port=" + port + " user=" + user + 
+               " password=" + pass + " dbname=" + name;
+    }
+};
 
 struct Filters {
     bool sendLat = true;
@@ -24,9 +43,9 @@ struct Filters {
 
 struct CellData {
     std::string type;
-    int ci = 0, pci = 0, tac = 0, mcc = 0, mnc = 0;
-    int rsrp = 0, rsrq = 0, rssi = 0, rssnr = 0, ta = 0;
-    int lac = 0, bsic = 0, arfcn = 0, band = 0;
+    int ci = 0, pci = 0, tac = 0;
+    int rsrp = 0, rsrq = 0, rssi = 0, ta = 0;
+    int lac = 0;
     long long nci = 0;
     int ss_rsrp = 0, ss_rsrq = 0, ss_sinr = 0;
 };
@@ -45,6 +64,28 @@ struct SignalHistory {
     std::vector<double> values;
     int pci;
     std::string label;
+};
+
+struct MobileDataCollection {
+    SensorData sensorData;
+    std::unordered_map<std::string, SignalHistory> signalHistories;
+    size_t maxHistoryPoints = 200;
+
+    MobileDataCollection() = default;
+    MobileDataCollection(const SensorData& sensor, 
+                         const std::unordered_map<std::string, SignalHistory>& histories)
+        : sensorData(sensor)
+        , signalHistories(histories) {
+    }
+    
+    void clear() {
+        sensorData = SensorData{};
+        signalHistories.clear();
+    }
+
+    bool isEmpty() const {
+        return sensorData.cells.empty() && signalHistories.empty();
+    }
 };
 
 std::unordered_map<std::string, SignalHistory> g_signalHistories;
@@ -68,8 +109,6 @@ void parse_cell_info(const json& j_cells) {
             c.lac = item.value("lac", 0);
             c.rssi = item.value("rssi", 0);
             c.ta = item.value("ta", 0);
-            c.bsic = item.value("bsic", 0);
-            c.arfcn = item.value("arfcn", 0);
         } else if (c.type == "nr") {
             c.nci = item.value("nci", 0LL);
             c.pci = item.value("pci", 0);
@@ -101,7 +140,7 @@ void update_signal_histories(const SensorData& data) {
         } else if (cell.type == "gsm") {
             cell_id = "gsm_" + std::to_string(cell.ci);
             signal_value = cell.rssi;
-            pci = cell.bsic;
+            pci = cell.ci;
         } else {
             continue;
         }
@@ -161,7 +200,200 @@ void from_json(const json& j, SensorData& s) {
     }
 }
 
+PGconn* connectToDatabase(const DbConfig& config) {
+    std::string conn_str = config.getConnectionString();
+    PGconn* con = PQconnectdb(conn_str.c_str());
+
+    if (!con || PQstatus(con) != CONNECTION_OK) {
+        std::cerr << "\033[31mОШИБКА\033[0m: Не удалось подключиться к БД: "
+                  << (con ? PQerrorMessage(con) : "PQconnectdb вернул nullptr") << "\n";
+        if (con) {
+            PQfinish(con);
+        }
+        return nullptr;
+    }
+
+    return con;
+}
+
+bool ensureDatabaseConnection(PGconn*& con, const DbConfig& config) {
+    if (con && PQstatus(con) == CONNECTION_OK) {
+        return true;
+    }
+
+    if (con) {
+        PQfinish(con);
+        con = nullptr;
+    }
+
+    con = connectToDatabase(config);
+    return con != nullptr;
+}
+
+bool insertMobileDataToDB(PGconn* con, const SensorData& data) {
+    if (!con || PQstatus(con) != CONNECTION_OK) {
+        std::cerr << "\033[31mОШИБКА\033[0m: Нет активного подключения к БД.\n";
+        return false;
+    }
+
+    PGresult* tx_begin = PQexec(con, "BEGIN");
+    if (PQresultStatus(tx_begin) != PGRES_COMMAND_OK) {
+        std::cerr << "\033[31mОШИБКА\033[0m: Не удалось начать транзакцию: "
+                  << PQresultErrorMessage(tx_begin) << "\n";
+        PQclear(tx_begin);
+        return false;
+    }
+    PQclear(tx_begin);
+
+    auto rollback = [con]() {
+        PGresult* tx_rollback = PQexec(con, "ROLLBACK");
+        if (tx_rollback) {
+            PQclear(tx_rollback);
+        }
+    };
+    
+    std::string lat_str = std::to_string(data.latitude);
+    std::string lon_str = std::to_string(data.longitude);
+    std::string alt_str = std::to_string(data.altitude);
+    std::string time_str = std::to_string(data.time);
+    
+    const char* location_params[] = {
+        lat_str.c_str(),
+        lon_str.c_str(),
+        alt_str.c_str(),
+        time_str.c_str()
+    };
+    
+    std::string location_query = "INSERT INTO location_data (latitude, longitude, altitude, timestamp) VALUES ($1, $2, $3, $4) RETURNING id";
+    
+    PGresult* location_res = PQexecParams(
+        con,
+        location_query.c_str(),
+        4,
+        NULL,
+        location_params,
+        NULL,
+        NULL,
+        0
+    );
+    
+    int location_id = 0;
+    
+    if (PQresultStatus(location_res) != PGRES_TUPLES_OK) {
+        std::cerr << "\033[31mОШИБКА\033[0m при вставке location_data: " 
+                  << PQresultErrorMessage(location_res) << "\n";
+        PQclear(location_res);
+        rollback();
+        return false;
+    } else {
+        if (PQntuples(location_res) > 0) {
+            location_id = std::stoi(PQgetvalue(location_res, 0, 0));
+            std::cout << "Location data вставлена \033[32mУСПЕШНО!\033[0m ID: " << location_id << "\n";
+        }
+    }
+    
+    PQclear(location_res);
+    for (const auto& cell : data.cells) {
+        std::string cell_type = cell.type;
+        std::string ci_str = (cell.type == "nr") ? "" : std::to_string(cell.ci);
+        std::string pci_str = std::to_string(cell.pci);
+        std::string tac_str = std::to_string(cell.tac);
+        std::string rsrp_str = std::to_string(cell.rsrp);
+        std::string rsrq_str = std::to_string(cell.rsrq);
+        std::string rssi_str = std::to_string(cell.rssi);
+        std::string ta_str = std::to_string(cell.ta);
+        std::string lac_str = std::to_string(cell.lac);
+        std::string nci_str = (cell.type == "nr") ? std::to_string(cell.nci) : "";
+        std::string ss_rsrp_str = std::to_string(cell.ss_rsrp);
+        std::string ss_rsrq_str = std::to_string(cell.ss_rsrq);
+        std::string ss_sinr_str = std::to_string(cell.ss_sinr);
+        std::string location_id_str = std::to_string(location_id);
+
+        const char* cell_params[] = {
+            location_id_str.c_str(),
+            cell_type.c_str(),
+            ci_str.empty() ? NULL : ci_str.c_str(),
+            pci_str.c_str(),
+            tac_str.c_str(),
+            rsrp_str.c_str(),
+            rsrq_str.c_str(),
+            rssi_str.c_str(),
+            ta_str.c_str(),
+            lac_str.c_str(),
+            nci_str.empty() ? NULL : nci_str.c_str(),
+            ss_rsrp_str.c_str(),
+            ss_rsrq_str.c_str(),
+            ss_sinr_str.c_str()
+        };
+
+        std::string cell_query = "INSERT INTO cell_data (location_id, cell_type, ci, pci, tac, rsrp, rsrq, rssi, ta, lac, nci, ss_rsrp, ss_rsrq, ss_sinr) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)";
+
+        PGresult* cell_res = PQexecParams(
+            con,
+            cell_query.c_str(),
+            14,
+            NULL,
+            cell_params,
+            NULL,
+            NULL,
+            0
+        );
+        if (PQresultStatus(cell_res) != PGRES_COMMAND_OK) {
+            std::cerr << "\033[31mОШИБКА\033[0m при вставке cell_data: " 
+                      << PQresultErrorMessage(cell_res) << "\n";
+            PQclear(cell_res);
+            rollback();
+            return false;
+        } else {
+            std::cout << "Cell data (тип: " << cell.type << ") вставлена \033[32mУСПЕШНО!\033[0m\n";
+        }
+        
+        PQclear(cell_res);
+    }
+
+    PGresult* tx_commit = PQexec(con, "COMMIT");
+    if (PQresultStatus(tx_commit) != PGRES_COMMAND_OK) {
+        std::cerr << "\033[31mОШИБКА\033[0m: Не удалось зафиксировать транзакцию: "
+                  << PQresultErrorMessage(tx_commit) << "\n";
+        PQclear(tx_commit);
+        rollback();
+        return false;
+    }
+    PQclear(tx_commit);
+    return true;
+}
+
 int main(int argc, char *argv[]) {
+    auto exe_dir = std::filesystem::canonical("/proc/self/exe").parent_path().string();
+    std::string env_path = exe_dir + "/../.env";
+    if (!std::filesystem::exists(env_path)) {
+        env_path = ".env";
+    }
+    dotenv::init(env_path.c_str());
+
+    auto get_env = [](const char* key) {
+        const char* val = std::getenv(key);
+        return val ? std::string(val) : "";
+    };
+
+    DbConfig config;
+    config.host = get_env("DB_HOST");
+    config.port = get_env("DB_PORT");
+    config.user = get_env("DB_USER");
+    config.pass = get_env("DB_PASS");
+    config.name = get_env("DB_NAME");
+
+    if (config.host.empty() || config.port.empty() || config.user.empty() || config.pass.empty() || config.name.empty()) {
+        std::cerr << "Ошибка: Не все данные для БД указаны в .env!" << std::endl;
+        return 1;
+    }
+
+    std::cout << "Подключаемся к: " << config.host << "..." << std::endl;
+    PGconn* db_connection = connectToDatabase(config);
+    if (!db_connection) {
+        return 1;
+    }
+
     const std::string output_dir = "./Location_save_data"; 
     std::filesystem::create_directories(output_dir);
 
@@ -216,6 +448,15 @@ int main(int argc, char *argv[]) {
                 }
 
                 g_sensorData.updated = true;
+
+                if (ensureDatabaseConnection(db_connection, config)) {
+                    if (!insertMobileDataToDB(db_connection, g_sensorData)) {
+                        std::cerr << "Пакет не записан в БД из-за ошибки транзакции.\n";
+                    }
+                } else {
+                    std::cerr << "Пакет не записан: нет подключения к БД.\n";
+                }
+                
                 json resp;
                 resp["f_lat"] = g_filters.sendLat;
                 resp["f_lon"] = g_filters.sendLon;
@@ -274,7 +515,7 @@ int main(int argc, char *argv[]) {
                 else ImGui::Text("%d", cell.ci);
 
                 ImGui::TableSetColumnIndex(2);
-                ImGui::Text("%d", (cell.type == "gsm" ? cell.bsic : cell.pci));
+                ImGui::Text("%d", (cell.type == "gsm" ? cell.ci : cell.pci));
 
                 ImGui::TableSetColumnIndex(3);
                 ImGui::Text("%d", (cell.type == "gsm" ? cell.lac : cell.tac));
@@ -307,6 +548,9 @@ int main(int argc, char *argv[]) {
     ImGui_ImplSDL2_Shutdown();
     ImPlot::DestroyContext();
     ImGui::DestroyContext();
+    if (db_connection) {
+        PQfinish(db_connection);
+    }
     SDL_GL_DeleteContext(gl_context);
     SDL_DestroyWindow(window);
     SDL_Quit();

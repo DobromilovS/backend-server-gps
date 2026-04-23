@@ -19,8 +19,15 @@ find_package(GLEW REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(ZMQ REQUIRED libzmq)
 
+# PostgreSQL libpq
+pkg_check_modules(PQ libpq)
+
+# dotenv-cpp (header-only)
+include_directories(${THIRD_PARTY_DIR}/dotenv-cpp/include)
+
 include_directories(${INCLUDE_DIR})
 include_directories(${ZMQ_INCLUDE_DIRS})
+include_directories(${PQ_INCLUDE_DIRS})
 
 add_library(imgui STATIC
     ${THIRD_PARTY_DIR}/imgui/imgui.cpp
@@ -46,11 +53,12 @@ target_compile_options(implot PRIVATE -fPIC)
 add_executable(main ${SRC_DIR}/main.cpp)
 
 # Линкуем все библиотеки
-target_link_libraries(main PRIVATE 
-    imgui 
-    implot 
-    ${SDL2_LIBRARIES} 
-    ${OPENGL_LIBRARIES} 
+target_link_libraries(main PRIVATE
+    imgui
+    implot
+    ${SDL2_LIBRARIES}
+    ${OPENGL_LIBRARIES}
     ${GLEW_LIBRARIES}
     ${ZMQ_LIBRARIES}
+    ${PQ_LIBRARIES}
 )
