@@ -50,7 +50,18 @@ target_include_directories(implot PUBLIC ${THIRD_PARTY_DIR}/implot)
 target_link_libraries(implot PRIVATE imgui)
 target_compile_options(implot PRIVATE -fPIC)
 
-add_executable(main ${SRC_DIR}/main.cpp)
+add_executable(main
+    ${SRC_DIR}/main.cpp
+    ${SRC_DIR}/data_processing.cpp
+    ${SRC_DIR}/database.cpp
+    ${SRC_DIR}/ui.cpp
+)
+
+target_include_directories(main PRIVATE
+    ${INCLUDE_DIR}
+    ${THIRD_PARTY_DIR}/imgui
+    ${THIRD_PARTY_DIR}/implot
+)
 
 # Линкуем все библиотеки
 target_link_libraries(main PRIVATE
