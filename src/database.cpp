@@ -1,5 +1,6 @@
 #include "database.h"
 
+#include <algorithm>
 #include <iostream>
 #include <string>
 
@@ -152,4 +153,58 @@ bool insertMobileDataToDB(PGconn* con, const SensorData& data) {
     PQclear(tx_commit);
 
     return true;
+}
+
+std::vector<LocationPoint> fetchRecentLocationPoints(PGconn* con, std::size_t limit) {
+    std::vector<LocationPoint> points;
+    if (!con || PQstatus(con) != CONNECTION_OK) {
+        return points;
+    }
+
+    PGresult* res = nullptr;
+    if (limit == 0) {
+        const std::string query =
+            "SELECT latitude, longitude, timestamp "
+            "FROM location_data "
+            "WHERE latitude IS NOT NULL AND longitude IS NOT NULL "
+            "ORDER BY timestamp DESC, id DESC";
+        res = PQexec(con, query.c_str());
+    } else {
+        const std::string limit_str = std::to_string(limit);
+        const char* params[] = {limit_str.c_str()};
+        const std::string query =
+            "SELECT latitude, longitude, timestamp "
+            "FROM location_data "
+            "WHERE latitude IS NOT NULL AND longitude IS NOT NULL "
+            "ORDER BY timestamp DESC, id DESC "
+            "LIMIT $1";
+        res = PQexecParams(con, query.c_str(), 1, nullptr, params, nullptr, nullptr, 0);
+    }
+
+    if (!res || PQresultStatus(res) != PGRES_TUPLES_OK) {
+        std::cerr << "\033[31mОШИБКА\033[0m: Не удалось прочитать точки карты: "
+                  << (res ? PQresultErrorMessage(res) : "PQexecParams вернул nullptr") << "\n";
+        if (res) {
+            PQclear(res);
+        }
+        return points;
+    }
+
+    const int rows = PQntuples(res);
+    points.reserve(static_cast<std::size_t>(rows));
+    for (int i = 0; i < rows; ++i) {
+        if (PQgetisnull(res, i, 0) || PQgetisnull(res, i, 1)) {
+            continue;
+        }
+
+        LocationPoint point;
+        point.latitude = std::stod(PQgetvalue(res, i, 0));
+        point.longitude = std::stod(PQgetvalue(res, i, 1));
+        point.timestamp = PQgetisnull(res, i, 2) ? 0 : std::stoll(PQgetvalue(res, i, 2));
+        points.push_back(point);
+    }
+
+    PQclear(res);
+    std::reverse(points.begin(), points.end());
+    return points;
 }

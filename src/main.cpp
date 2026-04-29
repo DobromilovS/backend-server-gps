@@ -5,12 +5,15 @@
 #include <nlohmann/json.hpp>
 #include <zmq.hpp>
 
+#include <cerrno>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "app_types.h"
 #include "backends/imgui_impl_opengl3.h"
@@ -25,6 +28,8 @@ using json = nlohmann::json;
 
 namespace {
 constexpr std::size_t kMaxHistoryPoints = 200;
+constexpr std::size_t kDefaultMapPointsLimit = 0;  // 0 = load all points from DB
+constexpr auto kMapRefreshInterval = std::chrono::seconds(2);
 }
 
 int main(int argc, char* argv[]) {
@@ -49,6 +54,16 @@ int main(int argc, char* argv[]) {
     config.user = get_env("DB_USER");
     config.pass = get_env("DB_PASS");
     config.name = get_env("DB_NAME");
+    std::size_t map_points_limit = kDefaultMapPointsLimit;
+    const std::string map_points_limit_env = get_env("MAP_POINTS_LIMIT");
+    if (!map_points_limit_env.empty()) {
+        try {
+            map_points_limit = static_cast<std::size_t>(std::stoull(map_points_limit_env));
+        } catch (...) {
+            std::cerr << "Предупреждение: MAP_POINTS_LIMIT некорректен, используем значение по умолчанию.\n";
+            map_points_limit = kDefaultMapPointsLimit;
+        }
+    }
 
     if (config.host.empty() || config.port.empty() || config.user.empty() || config.pass.empty() ||
         config.name.empty()) {
@@ -65,6 +80,8 @@ int main(int argc, char* argv[]) {
     SensorData sensorData;
     Filters filters;
     std::unordered_map<std::string, SignalHistory> signalHistories;
+    std::vector<LocationPoint> mapPoints;
+    auto last_map_refresh = std::chrono::steady_clock::now() - kMapRefreshInterval;
 
     const std::string output_dir = "./Location_save_data";
     std::filesystem::create_directories(output_dir);
@@ -90,7 +107,32 @@ int main(int argc, char* argv[]) {
 
     zmq::context_t context(1);
     zmq::socket_t socket(context, zmq::socket_type::rep);
-    socket.bind("tcp://*:7777");
+    std::string zmq_bind_endpoint = get_env("ZMQ_BIND_ENDPOINT");
+    if (zmq_bind_endpoint.empty()) {
+        zmq_bind_endpoint = "tcp://*:7777";
+    }
+
+    try {
+        socket.bind(zmq_bind_endpoint);
+    } catch (const zmq::error_t& e) {
+        std::cerr << "Ошибка bind для ZMQ endpoint '" << zmq_bind_endpoint << "': " << e.what()
+                  << "\n";
+        if (e.num() == EADDRINUSE) {
+            std::cerr << "Порт уже занят. Останови старый процесс или задай другой endpoint в .env:\n"
+                      << "ZMQ_BIND_ENDPOINT=tcp://*:7778\n";
+        }
+        return 1;
+    }
+
+    auto refresh_map_points = [&]() {
+        if (!ensureDatabaseConnection(db_connection, config)) {
+            return;
+        }
+        mapPoints = fetchRecentLocationPoints(db_connection, map_points_limit);
+        last_map_refresh = std::chrono::steady_clock::now();
+    };
+
+    refresh_map_points();
 
     bool running = true;
     while (running) {
@@ -103,6 +145,7 @@ int main(int argc, char* argv[]) {
         }
 
         zmq::message_t request;
+        bool need_refresh_map = false;
         if (socket.recv(request, zmq::recv_flags::dontwait)) {
             std::string received_data(static_cast<char*>(request.data()), request.size());
 
@@ -133,6 +176,8 @@ int main(int argc, char* argv[]) {
                 if (ensureDatabaseConnection(db_connection, config)) {
                     if (!insertMobileDataToDB(db_connection, sensorData)) {
                         std::cerr << "Пакет не записан в БД из-за ошибки транзакции.\n";
+                    } else {
+                        need_refresh_map = true;
                     }
                 } else {
                     std::cerr << "Пакет не записан: нет подключения к БД.\n";
@@ -148,10 +193,15 @@ int main(int argc, char* argv[]) {
             }
         }
 
+        const auto now = std::chrono::steady_clock::now();
+        if (need_refresh_map || now - last_map_refresh >= kMapRefreshInterval) {
+            refresh_map_points();
+        }
+
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplSDL2_NewFrame();
         ImGui::NewFrame();
-        renderDashboardUI(sensorData, filters, signalHistories);
+        renderDashboardUI(sensorData, filters, signalHistories, mapPoints);
 
         ImGui::Render();
         glClearColor(0.1f, 0.1f, 0.1f, 1.0f);

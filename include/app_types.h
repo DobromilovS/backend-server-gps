@@ -56,6 +56,12 @@ struct SignalHistory {
     std::string label;
 };
 
+struct LocationPoint {
+    double latitude = 0.0;
+    double longitude = 0.0;
+    long long timestamp = 0;
+};
+
 struct MobileDataCollection {
     SensorData sensorData;
     std::unordered_map<std::string, SignalHistory> signalHistories;

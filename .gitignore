@@ -2,7 +2,7 @@
 build/
 cmake-build-*/
 out/
-
+Location_save_data
 .env
 .env.example
 
