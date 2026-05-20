@@ -5,6 +5,7 @@ out/
 Location_save_data
 .env
 .env.example
+*docs
 
 *.o
 *.obj

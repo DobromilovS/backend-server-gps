@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS cell_data (
     location_id INTEGER REFERENCES location_data(id),
     cell_type VARCHAR(10),
     ci INTEGER,
+    earfcn INTEGER,
     pci INTEGER,
     tac INTEGER,
     rsrp INTEGER,
@@ -30,3 +31,4 @@ CREATE TABLE IF NOT EXISTS cell_data (
 CREATE INDEX IF NOT EXISTS idx_location_timestamp ON location_data(timestamp);
 CREATE INDEX IF NOT EXISTS idx_cell_data_location_id ON cell_data(location_id);
 CREATE INDEX IF NOT EXISTS idx_cell_data_type ON cell_data(cell_type);
+CREATE INDEX IF NOT EXISTS idx_cell_data_earfcn ON cell_data(earfcn);

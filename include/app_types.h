@@ -24,9 +24,31 @@ struct Filters {
     bool sendAlt = true;
 };
 
+enum class HeatmapCriterion {
+    RSRP = 0,
+    RSRQ,
+    RSSI,
+    Altitude,
+};
+
+struct HeatmapSettings {
+    bool enabled = false;
+    HeatmapCriterion criterion = HeatmapCriterion::RSRP;
+    int selectedEarfcn = -1;
+    double radiusMeters = 30.0;
+};
+
+struct HeatmapSample {
+    double latitude = 0.0;
+    double longitude = 0.0;
+    double value = 0.0;
+    int earfcn = -1;
+};
+
 struct CellData {
     std::string type;
     int ci = 0;
+    int earfcn = -1;
     int pci = 0;
     int tac = 0;
     int rsrp = 0;

@@ -4,6 +4,22 @@
 #include <iostream>
 #include <string>
 
+namespace {
+const char* metricExpression(HeatmapCriterion criterion) {
+    switch (criterion) {
+        case HeatmapCriterion::RSRP:
+            return "c.rsrp";
+        case HeatmapCriterion::RSRQ:
+            return "c.rsrq";
+        case HeatmapCriterion::RSSI:
+            return "c.rssi";
+        case HeatmapCriterion::Altitude:
+            return "l.altitude";
+    }
+    return "c.rsrp";
+}
+}  // namespace
+
 PGconn* connectToDatabase(const DbConfig& config) {
     const std::string conn_str = config.getConnectionString();
     PGconn* con = PQconnectdb(conn_str.c_str());
@@ -32,6 +48,31 @@ bool ensureDatabaseConnection(PGconn*& con, const DbConfig& config) {
 
     con = connectToDatabase(config);
     return con != nullptr;
+}
+
+bool ensureDatabaseSchema(PGconn* con) {
+    if (!con || PQstatus(con) != CONNECTION_OK) {
+        return false;
+    }
+
+    const char* statements[] = {
+        "ALTER TABLE cell_data ADD COLUMN IF NOT EXISTS earfcn INTEGER",
+        "CREATE INDEX IF NOT EXISTS idx_cell_data_earfcn ON cell_data(earfcn)"};
+
+    for (const char* statement : statements) {
+        PGresult* res = PQexec(con, statement);
+        if (!res || PQresultStatus(res) != PGRES_COMMAND_OK) {
+            std::cerr << "\033[31mОШИБКА\033[0m: Не удалось обновить схему БД: "
+                      << (res ? PQresultErrorMessage(res) : "PQexec вернул nullptr") << "\n";
+            if (res) {
+                PQclear(res);
+            }
+            return false;
+        }
+        PQclear(res);
+    }
+
+    return true;
 }
 
 bool insertMobileDataToDB(PGconn* con, const SensorData& data) {
@@ -94,6 +135,7 @@ bool insertMobileDataToDB(PGconn* con, const SensorData& data) {
     for (const auto& cell : data.cells) {
         const std::string cell_type = cell.type;
         const std::string ci_str = (cell.type == "nr") ? "" : std::to_string(cell.ci);
+        const std::string earfcn_str = cell.earfcn >= 0 ? std::to_string(cell.earfcn) : "";
         const std::string pci_str = std::to_string(cell.pci);
         const std::string tac_str = std::to_string(cell.tac);
         const std::string rsrp_str = std::to_string(cell.rsrp);
@@ -111,6 +153,7 @@ bool insertMobileDataToDB(PGconn* con, const SensorData& data) {
             location_id_str.c_str(),
             cell_type.c_str(),
             ci_str.empty() ? nullptr : ci_str.c_str(),
+            earfcn_str.empty() ? nullptr : earfcn_str.c_str(),
             pci_str.c_str(),
             tac_str.c_str(),
             rsrp_str.c_str(),
@@ -124,12 +167,12 @@ bool insertMobileDataToDB(PGconn* con, const SensorData& data) {
             ss_sinr_str.c_str()};
 
         const std::string cell_query =
-            "INSERT INTO cell_data (location_id, cell_type, ci, pci, tac, rsrp, rsrq, rssi, "
+            "INSERT INTO cell_data (location_id, cell_type, ci, earfcn, pci, tac, rsrp, rsrq, rssi, "
             "ta, lac, nci, ss_rsrp, ss_rsrq, ss_sinr) "
-            "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)";
+            "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)";
 
         PGresult* cell_res = PQexecParams(
-            con, cell_query.c_str(), 14, nullptr, cell_params, nullptr, nullptr, 0);
+            con, cell_query.c_str(), 15, nullptr, cell_params, nullptr, nullptr, 0);
         if (PQresultStatus(cell_res) != PGRES_COMMAND_OK) {
             std::cerr << "\033[31mОШИБКА\033[0m при вставке cell_data: "
                       << PQresultErrorMessage(cell_res) << "\n";
@@ -207,4 +250,111 @@ std::vector<LocationPoint> fetchRecentLocationPoints(PGconn* con, std::size_t li
     PQclear(res);
     std::reverse(points.begin(), points.end());
     return points;
+}
+
+std::vector<int> fetchAvailableEarfcns(PGconn* con) {
+    std::vector<int> earfcns;
+    if (!con || PQstatus(con) != CONNECTION_OK) {
+        return earfcns;
+    }
+
+    const std::string query =
+        "SELECT DISTINCT earfcn "
+        "FROM cell_data "
+        "WHERE earfcn IS NOT NULL "
+        "ORDER BY earfcn";
+
+    PGresult* res = PQexec(con, query.c_str());
+    if (!res || PQresultStatus(res) != PGRES_TUPLES_OK) {
+        std::cerr << "\033[31mОШИБКА\033[0m: Не удалось прочитать список EARFCN: "
+                  << (res ? PQresultErrorMessage(res) : "PQexec вернул nullptr") << "\n";
+        if (res) {
+            PQclear(res);
+        }
+        return earfcns;
+    }
+
+    const int rows = PQntuples(res);
+    earfcns.reserve(static_cast<std::size_t>(rows));
+    for (int i = 0; i < rows; ++i) {
+        if (!PQgetisnull(res, i, 0)) {
+            earfcns.push_back(std::stoi(PQgetvalue(res, i, 0)));
+        }
+    }
+
+    PQclear(res);
+    return earfcns;
+}
+
+std::vector<HeatmapSample> fetchHeatmapSamples(
+    PGconn* con,
+    HeatmapCriterion criterion,
+    int earfcn) {
+    std::vector<HeatmapSample> samples;
+    if (!con || PQstatus(con) != CONNECTION_OK) {
+        return samples;
+    }
+
+    PGresult* res = nullptr;
+    if (criterion == HeatmapCriterion::Altitude && earfcn < 0) {
+        const std::string query =
+            "SELECT latitude, longitude, altitude AS value "
+            "FROM location_data "
+            "WHERE latitude IS NOT NULL "
+            "AND longitude IS NOT NULL "
+            "AND altitude IS NOT NULL "
+            "ORDER BY timestamp, id";
+        res = PQexec(con, query.c_str());
+    } else {
+        const std::string metric = metricExpression(criterion);
+        const std::string signal_filter =
+            criterion == HeatmapCriterion::Altitude ? std::string{} : "AND " + metric + " < 0 ";
+        const std::string earfcn_filter = earfcn >= 0 ? "AND c.earfcn = $1 " : "";
+        const std::string query =
+            "SELECT l.latitude, l.longitude, AVG(" + metric + ") AS value "
+            "FROM location_data l "
+            "JOIN cell_data c ON c.location_id = l.id "
+            "WHERE l.latitude IS NOT NULL "
+            "AND l.longitude IS NOT NULL "
+            "AND " + metric + " IS NOT NULL "
+            + signal_filter +
+            earfcn_filter +
+            "GROUP BY l.id, l.latitude, l.longitude "
+            "ORDER BY MIN(l.timestamp), l.id";
+
+        if (earfcn >= 0) {
+            const std::string earfcn_str = std::to_string(earfcn);
+            const char* params[] = {earfcn_str.c_str()};
+            res = PQexecParams(con, query.c_str(), 1, nullptr, params, nullptr, nullptr, 0);
+        } else {
+            res = PQexec(con, query.c_str());
+        }
+    }
+
+    if (!res || PQresultStatus(res) != PGRES_TUPLES_OK) {
+        std::cerr << "\033[31mОШИБКА\033[0m: Не удалось прочитать сэмплы тепловой карты: "
+                  << (res ? PQresultErrorMessage(res) : "PQexec вернул nullptr") << "\n";
+        if (res) {
+            PQclear(res);
+        }
+        return samples;
+    }
+
+    const int rows = PQntuples(res);
+    samples.reserve(static_cast<std::size_t>(rows));
+    for (int i = 0; i < rows; ++i) {
+        if (PQgetisnull(res, i, 0) || PQgetisnull(res, i, 1) || PQgetisnull(res, i, 2)) {
+            continue;
+        }
+
+        HeatmapSample sample;
+        sample.latitude = std::stod(PQgetvalue(res, i, 0));
+        sample.longitude = std::stod(PQgetvalue(res, i, 1));
+        sample.value = std::stod(PQgetvalue(res, i, 2));
+        sample.earfcn = earfcn;
+        samples.push_back(sample);
+    }
+
+    PQclear(res);
+    return samples;
 }

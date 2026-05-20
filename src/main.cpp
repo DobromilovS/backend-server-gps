@@ -5,6 +5,7 @@
 #include <nlohmann/json.hpp>
 #include <zmq.hpp>
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstdlib>
@@ -76,11 +77,18 @@ int main(int argc, char* argv[]) {
     if (!db_connection) {
         return 1;
     }
+    if (!ensureDatabaseSchema(db_connection)) {
+        PQfinish(db_connection);
+        return 1;
+    }
 
     SensorData sensorData;
     Filters filters;
+    HeatmapSettings heatmapSettings;
     std::unordered_map<std::string, SignalHistory> signalHistories;
     std::vector<LocationPoint> mapPoints;
+    std::vector<int> availableEarfcns;
+    std::vector<HeatmapSample> heatmapSamples;
     auto last_map_refresh = std::chrono::steady_clock::now() - kMapRefreshInterval;
 
     const std::string output_dir = "./Location_save_data";
@@ -124,15 +132,31 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    auto refresh_map_points = [&]() {
+    auto refresh_database_views = [&]() {
         if (!ensureDatabaseConnection(db_connection, config)) {
             return;
         }
+        if (!ensureDatabaseSchema(db_connection)) {
+            return;
+        }
+
         mapPoints = fetchRecentLocationPoints(db_connection, map_points_limit);
+        availableEarfcns = fetchAvailableEarfcns(db_connection);
+        const bool selected_missing =
+            heatmapSettings.selectedEarfcn != -1 &&
+            std::find(availableEarfcns.begin(), availableEarfcns.end(), heatmapSettings.selectedEarfcn) ==
+                availableEarfcns.end();
+        if (selected_missing) {
+            heatmapSettings.selectedEarfcn = -1;
+        }
+        heatmapSamples = fetchHeatmapSamples(
+            db_connection,
+            heatmapSettings.criterion,
+            heatmapSettings.selectedEarfcn);
         last_map_refresh = std::chrono::steady_clock::now();
     };
 
-    refresh_map_points();
+    refresh_database_views();
 
     bool running = true;
     while (running) {
@@ -173,7 +197,7 @@ int main(int argc, char* argv[]) {
 
                 sensorData.updated = true;
 
-                if (ensureDatabaseConnection(db_connection, config)) {
+                if (ensureDatabaseConnection(db_connection, config) && ensureDatabaseSchema(db_connection)) {
                     if (!insertMobileDataToDB(db_connection, sensorData)) {
                         std::cerr << "Пакет не записан в БД из-за ошибки транзакции.\n";
                     } else {
@@ -189,19 +213,55 @@ int main(int argc, char* argv[]) {
                 resp["f_alt"] = filters.sendAlt;
                 std::string s = resp.dump();
                 socket.send(zmq::message_t(s.data(), s.size()), zmq::send_flags::none);
+            } catch (const std::exception& e) {
+                std::cerr << "Ошибка обработки входящего JSON: " << e.what() << "\n";
+                json resp;
+                resp["error"] = "invalid_payload";
+                resp["f_lat"] = filters.sendLat;
+                resp["f_lon"] = filters.sendLon;
+                resp["f_alt"] = filters.sendAlt;
+                std::string s = resp.dump();
+                socket.send(zmq::message_t(s.data(), s.size()), zmq::send_flags::none);
             } catch (...) {
+                json resp;
+                resp["error"] = "unknown_error";
+                resp["f_lat"] = filters.sendLat;
+                resp["f_lon"] = filters.sendLon;
+                resp["f_alt"] = filters.sendAlt;
+                std::string s = resp.dump();
+                socket.send(zmq::message_t(s.data(), s.size()), zmq::send_flags::none);
             }
         }
 
         const auto now = std::chrono::steady_clock::now();
         if (need_refresh_map || now - last_map_refresh >= kMapRefreshInterval) {
-            refresh_map_points();
+            refresh_database_views();
         }
+
+        const HeatmapCriterion previous_criterion = heatmapSettings.criterion;
+        const int previous_earfcn = heatmapSettings.selectedEarfcn;
 
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplSDL2_NewFrame();
         ImGui::NewFrame();
-        renderDashboardUI(sensorData, filters, signalHistories, mapPoints);
+        renderDashboardUI(
+            sensorData,
+            filters,
+            heatmapSettings,
+            signalHistories,
+            mapPoints,
+            availableEarfcns,
+            heatmapSamples);
+
+        if (previous_criterion != heatmapSettings.criterion ||
+            previous_earfcn != heatmapSettings.selectedEarfcn) {
+            if (ensureDatabaseConnection(db_connection, config) && ensureDatabaseSchema(db_connection)) {
+                heatmapSamples = fetchHeatmapSamples(
+                    db_connection,
+                    heatmapSettings.criterion,
+                    heatmapSettings.selectedEarfcn);
+            }
+        }
 
         ImGui::Render();
         glClearColor(0.1f, 0.1f, 0.1f, 1.0f);

@@ -10,6 +10,7 @@ void parse_cell_info(const json& j_cells, SensorData& sensorData) {
     for (auto& item : j_cells) {
         CellData c;
         c.type = item.value("type", "unknown");
+        c.earfcn = item.value("earfcn", item.value("EARFCN", item.value("arfcn", -1)));
         if (c.type == "lte") {
             c.ci = item.value("ci", 0);
             c.pci = item.value("pci", 0);
@@ -94,6 +95,7 @@ void update_signal_histories(
 
 void from_json(const json& j, CellData& c) {
     c.type = j.value("type", "unknown");
+    c.earfcn = j.value("earfcn", j.value("EARFCN", j.value("arfcn", -1)));
     if (c.type == "lte") {
         c.ci = j.value("ci", 0);
         c.pci = j.value("pci", 0);
